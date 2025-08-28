@@ -1,87 +1,90 @@
-// index.js ＊このファイルに丸ごと貼り替え
-import express from "express";
-import { Client } from "@line/bot-sdk";
-import dayjs from "dayjs";
-import { google } from "googleapis";
+// ==== 必須ライブラリ ====
+const express = require('express');
+const { Client, middleware } = require('@line/bot-sdk');
+const { google } = require('googleapis');
 
-// ===== LINE設定（Renderの環境変数）=====
+// ==== LINE 設定（Render の環境変数）====
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
 const client = new Client(config);
 
-// ===== Google Sheets クライアント =====
-const auth = new google.auth.JWT(
-  process.env.GOOGLE_CLIENT_EMAIL,
-  null,
-  // 秘密鍵の \n を本物の改行に直す
-  process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, "\n"),
-  ["https://www.googleapis.com/auth/spreadsheets"]
-);
-const sheets = google.sheets({ version: "v4", auth });
-const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
-const SHEET_NAME = process.env.SHEET_NAME || "Sheet1"; // なければSheet1
+// ==== Google Sheets 追記関数（環境変数名の揺れを吸収）====
+async function appendToSheet(values) {
+  const credsRaw =
+    process.env.GOOGLE_SERVICE_JSON ||
+    process.env.GOOGLE_CREDENTIALS ||
+    process.env.GOOGLE_JSON;
 
-async function appendToSheet({ timestamp, userId, displayName, message }) {
+  if (!credsRaw) {
+    console.error('No Google service account JSON in env');
+    return; // シート連携はスキップ（返信は続行）
+  }
+
+  const auth = new google.auth.GoogleAuth({
+    credentials: JSON.parse(credsRaw),
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+  });
+  const sheets = google.sheets({ version: 'v4', auth });
+
+  const spreadsheetId = process.env.SPREADSHEET_ID || process.env.SHEET_ID;
+  const sheetName = process.env.SHEET_NAME || 'Sheet1';
+
   await sheets.spreadsheets.values.append({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${SHEET_NAME}!A:D`,
-    valueInputOption: "USER_ENTERED",
-    requestBody: {
-      values: [[timestamp, userId, displayName, message]],
-    },
+    spreadsheetId,
+    range: `${sheetName}!A:D`, // timestamp, userId, displayName, message
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [values] },
   });
 }
 
-// ===== Express =====
-const app = express();
-app.use(express.json());
+// ==== 受信テキスト処理 ====
+async function handleTextMessage(event) {
+  const text = (event.message.text || '').trim();
+  const userId = event.source?.userId || '';
 
-// Webhook 受け口
-app.post("/webhook", (req, res) => {
-  Promise.all(req.body.events.map(handleEvent))
-    .then(() => res.json({}))
-    .catch((err) => {
-      console.error(err);
-      res.status(500).end();
-    });
+  let displayName = '';
+  try {
+    const prof = await client.getProfile(userId);
+    displayName = prof?.displayName || '';
+  } catch (_) {
+    // 取得できないケースは無視
+  }
+
+  // 返信（これまで通り）
+  await client.replyMessage(event.replyToken, {
+    type: 'text',
+    text: `受け取りました: ${text}`,
+  });
+
+  // Sheets へ記録（失敗してもアプリは落とさない）
+  try {
+    await appendToSheet([new Date().toISOString(), userId, displayName, text]);
+  } catch (e) {
+    console.error('appendToSheet error', e);
+  }
+}
+
+// ==== Express + Webhook ====
+const app = express();
+app.post('/webhook', middleware(config), async (req, res) => {
+  const results = await Promise.all(
+    req.body.events.map(async (event) => {
+      if (event.type === 'message' && event.message.type === 'text') {
+        return handleTextMessage(event);
+      }
+      // 他のイベントは無視
+      return Promise.resolve(null);
+    })
+  );
+  res.json(results);
 });
 
-// イベント処理
-async function handleEvent(event) {
-  if (event.type !== "message" || event.message.type !== "text") return;
+// Render で起動
+const port = process.env.PORT || 10000;
+app.listen(port, () => {
+  console.log(`LINE bot is running on port ${port}`);
+});
 
-  const userId = event.source?.userId || "";
-  const userMessage = event.message.text;
-
-  // 表示名（取れなかったら空）
-  let displayName = "";
-  try {
-    const profile = await client.getProfile(userId);
-    displayName = profile.displayName || "";
-  } catch (e) {
-    console.warn("getProfile failed:", e.message);
-  }
-
-  const timestamp = dayjs().format("YYYY/MM/DD HH:mm:ss");
-
-  // シートへ追記（失敗しても返信はする）
-  try {
-    await appendToSheet({ timestamp, userId, displayName, message: userMessage });
-  } catch (e) {
-    console.error("appendToSheet error:", e);
-  }
-
-  // 返信
-  return client.replyMessage(event.replyToken, {
-    type: "text",
-    text: `受け取りました: ${userMessage}\n(${timestamp})`,
-  });
-}
-
-// 動作確認用
-app.get("/", (_req, res) => res.send("ok"));
-
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`LINE bot is running on port ${port}`));
+module.exports = app;
