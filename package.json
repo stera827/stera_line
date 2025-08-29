@@ -4,9 +4,8 @@
   "main": "index.js",
   "license": "MIT",
   "type": "commonjs",
-  "scripts": {
-    "start": "node index.js"
-  },
+  "scripts": { "start": "node index.js" },
+  "engines": { "node": ">=18 <23" },
   "dependencies": {
     "express": "^4.18.2",
     "@line/bot-sdk": "^7.8.0",
