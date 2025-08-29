@@ -1,279 +1,191 @@
 // ==== 必須ライブラリ ====
 const express = require('express');
 const { Client, middleware } = require('@line/bot-sdk');
-const { google } = require('googleapis'); // 後でLOG_TO_SHEETS=1のときだけ使用
+const dayjs = require('dayjs');
 
-// ==== LINE 設定（Render の環境変数）====
+// ==== LINE 設定（Render の環境変数を使う）====
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
 const client = new Client(config);
 
-// ==== メモリ保持（サーバ再起動で消える簡易ストア）====
-const sessions = new Map();
-const yen = (n) => (isNaN(n) ? 0 : Number(n));
-const fmtY = (n) => `${Math.round(n).toLocaleString()}円`;
-const fmtH = (h) => `${(Math.round(h * 100) / 100).toFixed(2)}h`;
-
-function getState(userId) {
-  if (!sessions.has(userId)) {
-    sessions.set(userId, {
-      name: '',           // 表示名（必要なら手動設定可）
-      start: null,        // 出勤Date
-      end: null,          // 退勤Date
-      wage: 0,            // 時給
-      drink: 0,           // ドリンクバック(円) ※D1500xN/D2500xN も対応
-      douhan: 0,          // 同伴バック(円) 例: 同伴 1 → 2000
-      request: 0,         // リクエスト(円) 例: リクエ 5000 → 70%を計上
-      champagne: 0,       // シャンパン(円) 例: シャンパン 20000 12000 → (売上-原価)*10%
-      okuri: 0,           // 送り(円) ※最後に差し引き
-    });
+// ====== ユーザーごとの入力状態を記録（簡易RAM保存）======
+/*
+  state[userId] = {
+    clockIn: "HH:mm",
+    clockOut: "HH:mm",
+    hourly: number,
+    drink: number,
+    dohan: number,
+    request: number,
+    champagne: number,
+    okuri: number
   }
-  return sessions.get(userId);
+*/
+const state = Object.create(null);
+
+// ==== ユーティリティ ====
+const toYen = n => `${Math.round(n).toLocaleString()}円`;
+const floor10yen = n => Math.floor(n / 10) * 10;
+
+function parseNumber(s) {
+  // 先頭にある数値を抜く（カンマ許容）
+  const m = (s || '').replace(/[,，]/g, '').match(/-?\d+(\.\d+)?/);
+  return m ? Number(m[0]) : NaN;
 }
 
-// ==== 計算（仕様確定版）====
-// 小計 = 基本給 + ドリンク + 同伴 + リクエスト + シャンパン
-// 厚生費 = 小計10%（控除）→ 小計*0.9 を 10円単位切捨て
-// 最終 = (小計 - 厚生費) - 送り（最後に差し引き）
-function calc(state) {
+function setNum(userId, key, text) {
+  const val = parseNumber(text);
+  if (Number.isNaN(val)) return `数値が読み取れませんでした。例）「${key} 5000」`;
+  state[userId] ||= {};
+  state[userId][key] = val;
+  return `${labelOf(key)} を ${toYen(val)} に設定しました。`;
+}
+
+function labelOf(key) {
+  return ({
+    hourly: '時給',
+    drink: 'ドリンク',
+    dohan: '同伴',
+    request: 'リクエスト',
+    champagne: 'シャンパン',
+    okuri: '送り',
+    clockIn: '出勤',
+    clockOut: '退勤',
+  })[key] || key;
+}
+
+function setTime(userId, key, text) {
+  const m = text.match(/(\d{1,2}):?(\d{2})?/);
+  if (!m) return `時刻が読み取れませんでした。例）「${labelOf(key)} 18:30」`;
+  const hh = String(m[1]).padStart(2, '0');
+  const mm = String(m[2] ?? '00').padStart(2, '0');
+  state[userId] ||= {};
+  state[userId][key] = `${hh}:${mm}`;
+  return `${labelOf(key)} を ${hh}:${mm} に設定しました。`;
+}
+
+function calc(userId) {
+  const s = state[userId] || {};
+  const start = s.clockIn, end = s.clockOut, hourly = Number(s.hourly || 0);
+
+  // 勤務時間（小数時間）
   let hours = 0;
-  if (state.start && state.end) {
-    hours = (state.end - state.start) / (1000 * 60 * 60);
+  if (start && end) {
+    const today = dayjs().format('YYYY-MM-DD');
+    let t1 = dayjs(`${today} ${start}`);
+    let t2 = dayjs(`${today} ${end}`);
+    if (t2.isBefore(t1)) t2 = t2.add(1, 'day'); // 日跨ぎ対応
+    hours = t2.diff(t1, 'minute') / 60;
   }
-  const base = Math.max(0, state.wage * hours);
-  const subtotal = base + state.drink + state.douhan + state.request + state.champagne;
+  const basic = hourly * hours;
 
-  const afterWelfare = Math.floor((subtotal * 0.9) / 10) * 10; // 小計90%を10円切捨て
-  const total = afterWelfare - state.okuri;
+  const drink = Number(s.drink || 0);
+  const dohan = Number(s.dohan || 0);
+  const request = Number(s.request || 0);
+  const champagne = Number(s.champagne || 0);
+  const okuri = Number(s.okuri || 0);
 
-  return { hours, base, subtotal, afterWelfare, total };
+  const subtotal = basic + drink + dohan + request + champagne;
+  const welfare = floor10yen(subtotal * 0.10); // 厚生費10% → 10円単位切り捨て
+  const total = subtotal - welfare - okuri;
+
+  return {
+    hours,
+    basic,
+    drink,
+    dohan,
+    request,
+    champagne,
+    okuri,
+    welfare,
+    total,
+  };
 }
 
-// ==== Google Sheets 追記（任意ON/OFF）====
-async function appendToSheetIfEnabled(values) {
-  if (process.env.LOG_TO_SHEETS !== '1') return; // 後回し運用OK
-  const credsRaw =
-    process.env.GOOGLE_SERVICE_JSON ||
-    process.env.GOOGLE_CREDENTIALS ||
-    process.env.GOOGLE_JSON;
-
-  if (!credsRaw) { console.error('No Google service account JSON in env'); return; }
-
-  const auth = new google.auth.GoogleAuth({
-    credentials: JSON.parse(credsRaw),
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-  });
-  const sheets = google.sheets({ version: 'v4', auth });
-
-  const spreadsheetId = process.env.SPREADSHEET_ID || process.env.SHEET_ID;
-  const sheetName = process.env.SHEET_NAME || 'Sheet1';
-
-  await sheets.spreadsheets.values.append({
-    spreadsheetId,
-    range: `${sheetName}!A:P`,
-    valueInputOption: 'USER_ENTERED',
-    requestBody: { values: [values] },
-  });
+function viewForStaff(userId) {
+  const r = calc(userId);
+  return [
+    '— 明細（本人用）—',
+    `勤務時間: ${r.hours.toFixed(2)} 時間`,
+    `基本給: ${toYen(r.basic)}`,
+    `ドリンク: ${toYen(r.drink)}`,
+    `同伴: ${toYen(r.dohan)}`,
+    `リクエスト: ${toYen(r.request)}`,
+    `シャンパン: ${toYen(r.champagne)}`,
+    `厚生費(10%・10円切捨て): -${toYen(r.welfare)}`,
+    `送り: -${toYen(r.okuri)}`,
+    `———`,
+    `総額: ${toYen(r.total)}`,
+  ].join('\n');
 }
 
-// ==== テキストメッセージ処理（ここだけ触れば運用拡張可）====
+function viewForSeisan(userId) {
+  const r = calc(userId);
+  // 基本給は表示しない（総額は表示）
+  return [
+    '— 明細（清算担当用）—',
+    `ドリンク: ${toYen(r.drink)}`,
+    `同伴: ${toYen(r.dohan)}`,
+    `リクエスト: ${toYen(r.request)}`,
+    `シャンパン: ${toYen(r.champagne)}`,
+    `送り: -${toYen(r.okuri)}`,
+    `厚生費(10%・10円切捨て): -${toYen(r.welfare)}`,
+    `———`,
+    `総額: ${toYen(r.total)}`,
+  ].join('\n');
+}
+
+// ==== メッセージ処理 ====
 async function handleTextMessage(event) {
+  const userId = event.source?.userId || 'anonymous';
   const text = (event.message.text || '').trim();
-  const userId = event.source?.userId || '';
-  const state = getState(userId);
 
-  // 表示名（未設定ならLINEプロフィールから）
-  if (!state.name) {
-    try {
-      const prof = await client.getProfile(userId);
-      state.name = prof?.displayName || '';
-    } catch (_) {}
+  let reply = '';
+
+  if (/^出勤/i.test(text)) reply = setTime(userId, 'clockIn', text);
+  else if (/^退勤/i.test(text)) reply = setTime(userId, 'clockOut', text);
+  else if (/^時給/i.test(text)) reply = setNum(userId, 'hourly', text);
+  else if (/^ドリンク/i.test(text)) reply = setNum(userId, 'drink', text);
+  else if (/^同伴/i.test(text)) reply = setNum(userId, 'dohan', text);
+  else if (/^リクエスト/i.test(text)) reply = setNum(userId, 'request', text);
+  else if (/^シャンパン/i.test(text)) reply = setNum(userId, 'champagne', text);
+  else if (/^送り/i.test(text)) reply = setNum(userId, 'okuri', text);
+  else if (/^(確認|明細|合計)$/i.test(text)) reply = viewForStaff(userId);
+  else if (/^清算$/i.test(text)) reply = viewForSeisan(userId);
+  else if (/^リセット$/i.test(text)) {
+    delete state[userId];
+    reply = '入力内容をリセットしました。';
+  } else {
+    reply =
+      '入力例:\n' +
+      '出勤 18:00 / 退勤 23:30 / 時給 2000\n' +
+      'ドリンク 5000 / 同伴 3000 / リクエスト 2000 / シャンパン 10000 / 送り 1000\n' +
+      '確認 → 本人用明細を表示\n' +
+      '清算 → 清算担当用（基本給を非表示）\n' +
+      'リセット → クリア';
   }
 
-  // -------------- 入力コマンド --------------
-  // 出勤 HH:MM 時給 N
-  let m;
-  if ((m = text.match(/^出勤\s+(\d{1,2}):(\d{2})\s+時給\s+(\d+)/))) {
-    const [, hh, mm, wage] = m;
-    const now = new Date(); now.setHours(+hh, +mm, 0, 0);
-    state.start = now; state.wage = yen(wage);
-    await client.replyMessage(event.replyToken, { type:'text', text:`出勤を記録：${hh}:${mm}／時給 ${fmtY(state.wage)}` });
-    return;
-  }
-
-  // 退勤 HH:MM
-  if ((m = text.match(/^退勤\s+(\d{1,2}):(\d{2})/))) {
-    const [, hh, mm] = m;
-    const now = new Date(); now.setHours(+hh, +mm, 0, 0);
-    state.end = now;
-    const r = calc(state);
-    await client.replyMessage(event.replyToken, { type:'text', text:`退勤を記録：${hh}:${mm}（勤務 ${fmtH(r.hours)}）` });
-    return;
-  }
-
-  // 時給 N（後から修正したいとき）
-  if ((m = text.match(/^時給\s+(\d+)/))) {
-    state.wage = yen(m[1]);
-    await client.replyMessage(event.replyToken, { type:'text', text:`時給を ${fmtY(state.wage)} に更新しました。` });
-    return;
-  }
-
-  // ドリンク：①合計円で直入力 ②D1500xN と D2500xN の混在もOK（例: "D1500x3 D2500x2"）
-  if ((m = text.match(/^ドリンク\s+(-?\d+)/))) {
-    state.drink = yen(m[1]);
-    await client.replyMessage(event.replyToken, { type:'text', text:`ドリンク合計を ${fmtY(state.drink)} で記録しました。` });
-    return;
-  }
-  if (/D(1500|2500)x(\d+)/i.test(text)) {
-    let sum = 0;
-    const re = /D(1500|2500)x(\d+)/gi;
-    let t;
-    while ((t = re.exec(text))) {
-      const price = Number(t[1]), count = Number(t[2]);
-      if (price === 1500) sum += 300 * count;
-      if (price === 2500) sum += 500 * count;
-    }
-    state.drink = yen(sum);
-    await client.replyMessage(event.replyToken, { type:'text', text:`ドリンク（伝票換算）を ${fmtY(state.drink)} で記録しました。` });
-    return;
-  }
-
-  // 同伴：同伴 N（件数）→ 2000×N、または 同伴 金額（円）
-  if ((m = text.match(/^同伴\s+(\d+)$/))) {
-    const count = Number(m[1]);
-    if (count <= 10) {
-      state.douhan = 2000 * count;
-      await client.replyMessage(event.replyToken, { type:'text', text:`同伴 ${count}件 → ${fmtY(state.douhan)} を記録しました。` });
-      return;
-    }
-  }
-  if ((m = text.match(/^同伴\s+(-?\d+)/))) {
-    state.douhan = yen(m[1]);
-    await client.replyMessage(event.replyToken, { type:'text', text:`同伴を ${fmtY(state.douhan)} で記録しました。` });
-    return;
-  }
-
-  // リクエスト：売上から70%バック → 「リクエ 5000」
-  if ((m = text.match(/^(リクエ|リクエスト)\s+(\d+)/))) {
-    const uriage = yen(m[2]);
-    state.request = Math.round(uriage * 0.7);
-    await client.replyMessage(event.replyToken, { type:'text', text:`リクエスト: 売上 ${fmtY(uriage)} → バック ${fmtY(state.request)} を記録しました。` });
-    return;
-  }
-
-  // シャンパン： (売上 - 原価)×10% → 「シャンパン 20000 12000」
-  if ((m = text.match(/^シャンパン\s+(\d+)\s+(\d+)/))) {
-    const uriage = yen(m[1]), genka = yen(m[2]);
-    state.champagne = Math.round(Math.max(0, uriage - genka) * 0.1);
-    await client.replyMessage(event.replyToken, { type:'text', text:`シャンパン: 売上 ${fmtY(uriage)} - 原価 ${fmtY(genka)} → ${fmtY(state.champagne)} を記録しました。` });
-    return;
-  }
-
-  // 送り：控除（最後に差し引き） → 「送り 800」
-  if ((m = text.match(/^送り\s+(\-?\d+)/))) {
-    state.okuri = yen(m[1]);
-    await client.replyMessage(event.replyToken, { type:'text', text:`送り（控除）を ${fmtY(state.okuri)} で記録しました。` });
-    return;
-  }
-
-  // 氏名を手動設定したい場合 → 「名前 山田」 （任意）
-  if ((m = text.match(/^名前\s+(.+)/))) {
-    state.name = m[1].trim();
-    await client.replyMessage(event.replyToken, { type:'text', text:`名前を「${state.name}」に設定しました。` });
-    return;
-  }
-
-  // 清算（本人/オーナー向け：基本給も表示）
-  if (/^清算$/.test(text)) {
-    const r = calc(state);
-    const msg =
-`【清算（本人/オーナー向け）】
-名前：${state.name || '(未設定)'}
-勤務時間：${fmtH(r.hours)}
-時給：${fmtY(state.wage)}
-基本給：${fmtY(r.base)}
-ドリンク：${fmtY(state.drink)}
-同伴：${fmtY(state.douhan)}
-リクエスト：${fmtY(state.request)}
-シャンパン：${fmtY(state.champagne)}
-小計：${fmtY(r.subtotal)}
-厚生費10%後（10円切捨て）：${fmtY(r.afterWelfare)}
-送り（控除）：-${fmtY(state.okuri)}
-————————————
-総額：${fmtY(r.total)}`;
-    await client.replyMessage(event.replyToken, { type:'text', text: msg });
-
-    // 任意でログ行を追加（ONのときのみ）
-    try {
-      await appendToSheetIfEnabled([
-        new Date().toISOString(),
-        userId,
-        state.name,
-        state.start ? state.start.toLocaleString('ja-JP') : '',
-        state.end ? state.end.toLocaleString('ja-JP') : '',
-        state.wage, r.hours.toFixed(2), r.base,
-        state.drink, state.douhan, state.request, state.champagne,
-        r.subtotal, r.afterWelfare, state.okuri, r.total
-      ]);
-    } catch (e) { console.error('appendToSheet error', e?.message || e); }
-
-    return;
-  }
-
-  // 清算担当（基本給は非表示）
-  if (/^清算担当$/.test(text)) {
-    const r = calc(state);
-    const msg =
-`【清算（担当向け）】
-名前：${state.name || '(未設定)'}
-ドリンク：${fmtY(state.drink)}
-同伴：${fmtY(state.douhan)}
-リクエスト：${fmtY(state.request)}
-シャンパン：${fmtY(state.champagne)}
-厚生費10%後（10円切捨て）：${fmtY(r.afterWelfare)}
-送り（控除）：-${fmtY(state.okuri)}
-————————————
-総額：${fmtY(r.total)}
-※ 基本給（時給×時間）は非表示`;
-    await client.replyMessage(event.replyToken, { type:'text', text: msg });
-    return;
-  }
-
-  // リセット
-  if (/^リセット$/.test(text)) {
-    sessions.delete(userId);
-    await client.replyMessage(event.replyToken, { type:'text', text:'このトークの計算状態をリセットしました。' });
-    return;
-  }
-
-  // デフォルト応答（受け取り確認）
-  await client.replyMessage(event.replyToken, { type:'text', text:`受け取りました: ${text}` });
+  await client.replyMessage(event.replyToken, { type: 'text', text: reply });
 }
 
 // ==== Express + Webhook ====
 const app = express();
 app.post('/webhook', middleware(config), async (req, res) => {
-  try {
-    const events = req.body.events || [];
-    await Promise.all(events.map((event) => {
+  const results = await Promise.all(
+    req.body.events.map(async (event) => {
       if (event.type === 'message' && event.message.type === 'text') {
         return handleTextMessage(event);
       }
-      return Promise.resolve();
-    }));
-    res.json({ ok: true });
-  } catch (e) {
-    console.error(e);
-    res.status(500).end();
-  }
+      return Promise.resolve(null);
+    })
+  );
+  res.json(results);
 });
 
-// Render で起動
+// ==== Render で起動 ====
 const port = process.env.PORT || 10000;
-app.listen(port, () => {
-  console.log(`LINE bot is running on port ${port}`);
-});
+app.listen(port, () => console.log(`LINE bot is running on port ${port}`));
 
 module.exports = app;
