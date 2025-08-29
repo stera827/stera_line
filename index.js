@@ -19,7 +19,7 @@ async function appendToSheet(values) {
 
   if (!credsRaw) {
     console.error('No Google service account JSON in env');
-    return; // シート連携はスキップ（返信は続行）
+    return;
   }
 
   const auth = new google.auth.GoogleAuth({
@@ -28,7 +28,8 @@ async function appendToSheet(values) {
   });
   const sheets = google.sheets({ version: 'v4', auth });
 
-  const spreadsheetId = process.env.SPREADSHEET_ID || process.env.SHEET_ID;
+  const spreadsheetId =
+    process.env.SPREADSHEET_ID || process.env.SHEET_ID;
   const sheetName = process.env.SHEET_NAME || 'Sheet1';
 
   await sheets.spreadsheets.values.append({
@@ -42,49 +43,4 @@ async function appendToSheet(values) {
 // ==== 受信テキスト処理 ====
 async function handleTextMessage(event) {
   const text = (event.message.text || '').trim();
-  const userId = event.source?.userId || '';
-
-  let displayName = '';
-  try {
-    const prof = await client.getProfile(userId);
-    displayName = prof?.displayName || '';
-  } catch (_) {
-    // 取得できないケースは無視
-  }
-
-  // 返信（これまで通り）
-  await client.replyMessage(event.replyToken, {
-    type: 'text',
-    text: `受け取りました: ${text}`,
-  });
-
-  // Sheets へ記録（失敗してもアプリは落とさない）
-  try {
-    await appendToSheet([new Date().toISOString(), userId, displayName, text]);
-  } catch (e) {
-    console.error('appendToSheet error', e);
-  }
-}
-
-// ==== Express + Webhook ====
-const app = express();
-app.post('/webhook', middleware(config), async (req, res) => {
-  const results = await Promise.all(
-    req.body.events.map(async (event) => {
-      if (event.type === 'message' && event.message.type === 'text') {
-        return handleTextMessage(event);
-      }
-      // 他のイベントは無視
-      return Promise.resolve(null);
-    })
-  );
-  res.json(results);
-});
-
-// Render で起動
-const port = process.env.PORT || 10000;
-app.listen(port, () => {
-  console.log(`LINE bot is running on port ${port}`);
-});
-
-module.exports = app;
+  const userId = event.source?.user
